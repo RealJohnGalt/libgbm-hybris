@@ -214,8 +214,10 @@ struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type, void 
 
 // Suprisingly not part of libgbm
 uint32_t hybris_gbm_bo_get_stride(struct gbm_bo* bo, int plane) {
-    // x4 the stride, as it's checked by drm and drm expexcts stride to be at very least width*bpp
-    return bo ? (uint32_t)(bo->v0.stride * 4) : 0;
+    if (!bo)
+        return 0;
+
+    return (bo->v0.stride < (uint32_t)(bo->v0.width * 4)) ? (uint32_t)(bo->v0.stride * 4) : (uint32_t)(bo->v0.stride);
 }
 
 uint32_t hybris_gbm_bo_get_stride_for_plane(struct gbm_bo *bo, int plane)
@@ -281,8 +283,10 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
         return -1;
     }
 
-      if(write(fd, &bo->evdi_lindroid_buff_id, sizeof(int)) != sizeof(int)) {
-        printf("[libgbm-hybris] failed to write evdi_lindroid_buff_id into mefd\n");
+    if (write(fd, (int[2]){ bo->evdi_lindroid_buff_id,
+        (bo->base.v0.stride >= (int)(bo->base.v0.width * 4)) ? (bo->base.v0.stride / 4) : bo->base.v0.stride },
+        sizeof(int) * 2) != (ssize_t)(sizeof(int) * 2)) {
+        printf("[libgbm-hybris] failed to write payload into memfd\n");
         close(fd);
         return -1;
     }
