@@ -6,6 +6,8 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <string.h>
+#include <unistd.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/ioctl.h>
 
@@ -44,10 +46,58 @@ struct drm_evdi_gbm_del_buff {
 	int id;
 };
 
+/* Must match the kernel fake-PRIME payload */
+#define EVDI_PRIME_MAGIC 0x45564449 /* 'EVDI' */
+struct evdi_prime_payload {
+    int32_t  id;
+    uint32_t magic;
+};
+
+static int dup_cloexec(int fd)
+{
+    return fcntl(fd, F_DUPFD_CLOEXEC, 0);
+}
+
+static int evdi_write_payload_fd(int fd, int id)
+{
+    struct evdi_prime_payload p;
+
+    if (id <= 0)
+        return -EINVAL;
+
+    p.id = id;
+    p.magic = EVDI_PRIME_MAGIC;
+
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        return -errno;
+
+    if (write(fd, &p, sizeof(p)) != (ssize_t)sizeof(p))
+        return -EIO;
+
+    if (lseek(fd, 0, SEEK_SET) < 0)
+        return -errno;
+
+    return 0;
+}
+
+static int evdi_validate_payload_fd(int fd, int expected_id)
+{
+    struct evdi_prime_payload p;
+
+    if (pread(fd, &p, sizeof(p), 0) != (ssize_t)sizeof(p))
+        return -EIO;
+    if (p.id != expected_id)
+        return -EINVAL;
+    if (p.magic != EVDI_PRIME_MAGIC)
+        return -EINVAL;
+    return 0;
+}
+
 struct gbm_hybris_bo {
    struct gbm_bo base;
 //   buffer_handle_t handle;
    int evdi_lindroid_buff_id;
+   int prime_fd;
 };
 
 struct gbm_hybris_surface {
@@ -120,6 +170,7 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
 
     struct gbm_hybris_bo *bo;
     bo = calloc(1, sizeof(struct gbm_hybris_bo));
+    bo->prime_fd = -1;
 
     // Not inited in libgbm?
     bo->base.v0.user_data = NULL;
@@ -156,6 +207,12 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
     cmd.id = &bo->evdi_lindroid_buff_id;
     int ret = ioctl(device->v0.fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF, &cmd);
 
+    if (ret < 0 || bo->evdi_lindroid_buff_id <= 0) {
+        fprintf(stderr, "[libgbm-hybris] DRM_IOCTL_EVDI_GBM_CREATE_BUFF failed\n");
+        free(bo);
+        return NULL;
+    }
+
     bo->base.v0.stride = stride * 4;
     bo->base.v0.handle.u32 = hybris_gbm_bo_get_fd(&bo->base);
     return &bo->base;
@@ -164,6 +221,17 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
 static void hybris_gbm_bo_destroy(struct gbm_bo *_bo)
 {
     struct gbm_hybris_bo *bo = gbm_hybris_bo(_bo);
+
+    if (_bo->v0.handle.u32 > 0) {
+        close(_bo->v0.handle.u32);\
+        _bo->v0.handle.u32 = 0;
+    }
+
+    if (bo->prime_fd >= 0) {
+        close(bo->prime_fd);
+        bo->prime_fd = -1;
+     }
+
 //    if (bo->handle) {
   //      hybris_gralloc_release(bo->handle, 1);
     struct drm_evdi_gbm_del_buff close_args = {
@@ -178,7 +246,6 @@ static void hybris_gbm_bo_destroy(struct gbm_bo *_bo)
 //    native_handle_close(bo->handle);
 //    native_handle_delete(bo->handle);
 //}
-    close(_bo->v0.handle.u32);
     free(bo);
 }
 
@@ -270,11 +337,18 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
         return -1;
     }
 
+    if (bo->prime_fd >= 0) {
+        if (evdi_validate_payload_fd(bo->prime_fd, bo->evdi_lindroid_buff_id) < 0)
+            goto recreate;
+        return dup_cloexec(bo->prime_fd);
+    }
+
     if(bo->evdi_lindroid_buff_id == -1) {
         printf("[libgbm-hybris] missing evdi_lindroid_buff_id\n");
         return -1;
     }
 
+recreate:
     int fd = memfd_create("whatever", MFD_CLOEXEC);
 
     if (fd == -1) {
@@ -282,19 +356,27 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
         return -1;
     }
 
-    if(write(fd, &bo->evdi_lindroid_buff_id, sizeof(int)) != sizeof(int)) {
-        printf("[libgbm-hybris] failed to write evdi_lindroid_buff_id into mefd\n");
+    int wret = evdi_write_payload_fd(fd, bo->evdi_lindroid_buff_id);
+    if (wret < 0) {
+        printf("[libgbm-hybris] failed to write prime payload into memfd\n");
         close(fd);
         return -1;
     }
 
-    const size_t size = (size_t)bo->base.v0.stride * bo->base.v0.height;
+    size_t size = (size_t)bo->base.v0.stride * bo->base.v0.height;
+    if (size < sizeof(struct evdi_prime_payload))
+        size = sizeof(struct evdi_prime_payload);
+
     if (ftruncate(fd, size) < 0) {
         close(fd);
         return -1;
     }
 
-    return fd;
+    if (bo->prime_fd >= 0)
+        close(bo->prime_fd);
+
+    bo->prime_fd = fd;
+    return dup_cloexec(bo->prime_fd);
 }
 
 static union gbm_bo_handle hybris_gbm_bo_get_handle_for_plane(struct gbm_bo *_bo, int plane)
