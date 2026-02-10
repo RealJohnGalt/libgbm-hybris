@@ -1,3 +1,6 @@
+#include <errno.h>
+#include <pthread.h>
+#include <time.h>
 #include <fcntl.h> 
 #include <stddef.h>
 #include <xf86drm.h>
@@ -53,6 +56,19 @@ struct gbm_hybris_bo {
 struct gbm_hybris_surface {
    void *reserved_for_egl_gbm;
    struct gbm_surface base;
+   pthread_mutex_t mutex;
+   pthread_cond_t  cond;
+   int destroying;
+
+   uint32_t width;
+   uint32_t height;
+   uint32_t format;
+   uint32_t flags;
+
+#define HYBRIS_SWAPCHAIN_BO_COUNT 3
+   struct gbm_bo *bos[HYBRIS_SWAPCHAIN_BO_COUNT];
+   int in_use[HYBRIS_SWAPCHAIN_BO_COUNT];
+   int next_pick;
 };
 
 struct drm_evdi_gbm_create_buff {
@@ -64,6 +80,22 @@ struct drm_evdi_gbm_create_buff {
 };
 
 static const struct gbm_core *core;
+
+static inline struct gbm_hybris_surface *gbm_hybris_surface(struct gbm_surface *s)
+{
+   return (struct gbm_hybris_surface *)s;
+}
+
+static void cond_init_monotonic(pthread_cond_t *cond)
+{
+   pthread_condattr_t attr;
+   pthread_condattr_init(&attr);
+#ifdef CLOCK_MONOTONIC
+   (void)pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+#endif
+   pthread_cond_init(cond, &attr);
+   pthread_condattr_destroy(&attr);
+}
 
 int memfd_create(const char *name, unsigned int flags);
 
@@ -147,7 +179,6 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
         usage |= GRALLOC_USAGE_SW_READ_RARELY | GRALLOC_USAGE_SW_WRITE_RARELY;
 
     int stride = 0;
-    buffer_handle_t handle = NULL;
     struct drm_evdi_gbm_create_buff cmd;
     cmd.width = width;
     cmd.height = height;
@@ -161,7 +192,7 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
         return NULL;
     }
 
-    bo->base.v0.stride = stride * 4;
+    bo->base.v0.stride = (uint32_t)stride * 4;
     bo->base.v0.handle.u32 = (uint32_t)bo->evdi_lindroid_buff_id;
     return &bo->base;
 }
@@ -235,25 +266,150 @@ void* hybris_gbm_bo_map(struct gbm_bo *bo, uint32_t x, uint32_t y, uint32_t widt
     return NULL;
 }
 
-void hybris_gbm_surface_destroy(struct gbm_surface *surf) {
-//TBD: Implement surfaces
-    printf("[libgbm-hybris] gbm_surface_destroy called\n");
+static int hybris_surface_alloc_swapchain_locked(struct gbm_hybris_surface *surf)
+{
+    for (int i = 0; i < HYBRIS_SWAPCHAIN_BO_COUNT; ++i) {
+        if (surf->bos[i])
+            continue;
+
+        surf->bos[i] = hybris_gbm_bo_create(surf->base.gbm,
+                                            surf->width, surf->height,
+                                            surf->format, surf->flags,
+                                            NULL, 0);
+        if (!surf->bos[i]) {
+            for (int j = 0; j < HYBRIS_SWAPCHAIN_BO_COUNT; ++j) {
+                if (surf->bos[j]) {
+                    hybris_gbm_bo_destroy(surf->bos[j]);
+                    surf->bos[j] = NULL;
+                }
+                surf->in_use[j] = 0;
+            }
+            return -ENOMEM;
+        }
+        surf->in_use[i] = 0;
+    }
+    return 0;
 }
 
+static int hybris_gbm_surface_has_free_buffers(struct gbm_surface *surface)
+{
+    if (!surface)
+        return 0;
 
-struct gbm_bo* hybris_gbm_surface_lock_front_buffer(struct gbm_surface* surface) {
-//TBD: Implement surfaces
-    printf("[libgbm-hybris] gbm_surface_lock_front_buffer called\n");
-    return (struct gbm_bo*)malloc(sizeof(struct gbm_bo));
+    struct gbm_hybris_surface *surf = gbm_hybris_surface(surface);
+    pthread_mutex_lock(&surf->mutex);
+    if (!surf->bos[0] && !surf->bos[1] && !surf->bos[2]) {
+        (void)hybris_surface_alloc_swapchain_locked(surf);
+    }
+    int free_found = 0;
+    for (int i = 0; i < HYBRIS_SWAPCHAIN_BO_COUNT; ++i) {
+        if (surf->bos[i] && !surf->in_use[i]) {
+            free_found = 1;
+            break;
+        }
+    }
+    pthread_mutex_unlock(&surf->mutex);
+    return free_found;
 }
 
-void hybris_gbm_surface_release_buffer(struct gbm_surface* surface, struct gbm_bo* bo) {
-//TBD: Implement surfaces
-    printf("[libgbm-hybris] gbm_surface_release_buffer called\n");
-    if (bo) {
-        free(bo);
+static struct gbm_bo* hybris_gbm_surface_lock_front_buffer_impl(struct gbm_surface* surface)
+{
+    if (!surface) {
+        errno = EINVAL;
+        return NULL;
+    }
+
+    struct gbm_hybris_surface *surf = gbm_hybris_surface(surface);
+    pthread_mutex_lock(&surf->mutex);
+
+    if (surf->destroying) {
+        pthread_mutex_unlock(&surf->mutex);
+        errno = EINVAL;
+        return NULL;
+    }
+
+    if (!surf->bos[0] && !surf->bos[1] && !surf->bos[2]) {
+        int rc = hybris_surface_alloc_swapchain_locked(surf);
+        if (rc) {
+            pthread_mutex_unlock(&surf->mutex);
+            errno = ENOMEM;
+            return NULL;
+        }
+    }
+
+    for (;;) {
+        if (surf->destroying) {
+            pthread_mutex_unlock(&surf->mutex);
+            errno = EINVAL;
+            return NULL;
+        }
+
+        for (int n = 0; n < HYBRIS_SWAPCHAIN_BO_COUNT; ++n) {
+            const int i = (surf->next_pick + n) % HYBRIS_SWAPCHAIN_BO_COUNT;
+            if (surf->bos[i] && !surf->in_use[i]) {
+                surf->in_use[i] = 1;
+                surf->next_pick = (i + 1) % HYBRIS_SWAPCHAIN_BO_COUNT;
+                struct gbm_bo *bo = surf->bos[i];
+                pthread_mutex_unlock(&surf->mutex);
+                return bo;
+            }
+        }
+
+        pthread_cond_wait(&surf->cond, &surf->mutex);
     }
 }
+
+static void hybris_gbm_surface_release_buffer_impl(struct gbm_surface* surface, struct gbm_bo* bo)
+{
+    if (!surface || !bo)
+        return;
+
+    struct gbm_hybris_surface *surf = gbm_hybris_surface(surface);
+    pthread_mutex_lock(&surf->mutex);
+
+    for (int i = 0; i < HYBRIS_SWAPCHAIN_BO_COUNT; ++i) {
+        if (surf->bos[i] == bo) {
+            surf->in_use[i] = 0;
+            pthread_cond_signal(&surf->cond);
+            pthread_mutex_unlock(&surf->mutex);
+            return;
+        }
+    }
+
+    pthread_mutex_unlock(&surf->mutex);
+    fprintf(stderr, "[libgbm-hybris] gbm_surface_release_buffer called with foreign bo=%p\n", (void*)bo);
+}
+
+static void hybris_gbm_surface_destroy_impl(struct gbm_surface *surface)
+{
+    if (!surface)
+        return;
+
+    struct gbm_hybris_surface *surf = gbm_hybris_surface(surface);
+    pthread_mutex_lock(&surf->mutex);
+    surf->destroying = 1;
+    pthread_cond_broadcast(&surf->cond);
+
+    for (int i = 0; i < HYBRIS_SWAPCHAIN_BO_COUNT; ++i) {
+        if (surf->in_use[i]) {
+            fprintf(stderr, "[libgbm-hybris] WARNING: destroying surface with locked bo[%d]\n", i);
+        }
+    }
+
+    for (int i = 0; i < HYBRIS_SWAPCHAIN_BO_COUNT; ++i) {
+        if (surf->bos[i]) {
+            hybris_gbm_bo_destroy(surf->bos[i]);
+            surf->bos[i] = NULL;
+        }
+        surf->in_use[i] = 0;
+    }
+
+    pthread_mutex_unlock(&surf->mutex);
+    pthread_cond_destroy(&surf->cond);
+    pthread_mutex_destroy(&surf->mutex);
+    free(surf);
+}
+
 
 int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
     if(!_bo) {
@@ -286,7 +442,8 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
     }
 
     const size_t size = (size_t)bo->base.v0.stride * bo->base.v0.height;
-    if (ftruncate(fd, size) < 0) {
+    const size_t min_size = (size < sizeof(int)) ? sizeof(int) : size;
+    if (ftruncate(fd, (off_t)min_size) < 0) {
         close(fd);
         return -1;
     }
@@ -326,7 +483,6 @@ uint32_t hybris_bo_get_offset(struct gbm_bo *bo, int plane)
 }
 
 struct gbm_surface *hybris_gbm_surface_create_with_modifiers(struct gbm_device *gbm, uint32_t width, uint32_t height, uint32_t format, const uint64_t *modifiers, const unsigned int count){
-//TBD: Implement surfaces
    printf("[libgbm-hybris] gbm_surface_create_with_modifiers\n");
    if ((count && !modifiers) || (modifiers && !count)) {
       errno = EINVAL;
@@ -346,26 +502,43 @@ struct gbm_surface *hybris_gbm_surface_create(struct gbm_device *gbm, uint32_t w
         return NULL;
     }
 
-    surf->base.gbm = gbm;
-    surf->base.v0.width = width;
-    surf->base.v0.height = height;
-    surf->base.v0.format = get_hal_pixel_format(format);
-    surf->base.v0.flags = flags;
-    surf->base.v0.modifiers = calloc(count, sizeof(*modifiers));
-    if (count && !surf->base.v0.modifiers) {
-        errno = ENOMEM;
+    if ((count && !modifiers) || (modifiers && !count)) {
+        errno = EINVAL;
         free(surf);
         return NULL;
     }
 
-    //uint64_t *v0_modifiers = surf->base.v0.modifiers;
-    //for (int i = 0; i < count; i++) {
-        // compressed buffers don't render correctly when imported
-      //  if (modifiers[i] & ~DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0x0, 0x1, 0x3, 0xff, 0xf))
-      //      continue;
-      //  *v0_modifiers++ = modifiers[i];
-    //}
-    //surf->base.v0.count = v0_modifiers - surf->base.v0.modifiers;
+    format = core->v0.format_canonicalize(format);
+
+    surf->base.gbm = gbm;
+    surf->base.v0.width = width;
+    surf->base.v0.height = height;
+    surf->base.v0.format = format;
+    surf->base.v0.flags = flags;
+    surf->base.v0.modifiers = calloc(count, sizeof(*modifiers));
+    pthread_mutex_init(&surf->mutex, NULL);
+    cond_init_monotonic(&surf->cond);
+    surf->destroying = 0;
+
+    surf->width = width;
+    surf->height = height;
+    surf->format = format;
+    surf->flags = flags;
+    surf->next_pick = 0;
+
+    for (int i = 0; i < HYBRIS_SWAPCHAIN_BO_COUNT; ++i) {
+        surf->bos[i] = NULL;
+        surf->in_use[i] = 0;
+    }
+
+    pthread_mutex_lock(&surf->mutex);
+    int rc = hybris_surface_alloc_swapchain_locked(surf);
+    pthread_mutex_unlock(&surf->mutex);
+    if (rc) {
+        hybris_gbm_surface_destroy_impl(&surf->base);
+        errno = ENOMEM;
+        return NULL;
+    }
 
     return &surf->base;
 }
@@ -417,6 +590,10 @@ static struct gbm_device *hybris_device_create(int fd, uint32_t gbm_backend_vers
    device->v0.bo_get_planes = hybris_gbm_bo_get_plane_count;
    device->v0.bo_get_plane_fd = hybris_gbm_bo_get_fd_for_plane;
    device->v0.surface_create = hybris_gbm_surface_create;
+   device->v0.surface_destroy = hybris_gbm_surface_destroy_impl;
+   device->v0.surface_lock_front_buffer = hybris_gbm_surface_lock_front_buffer_impl;
+   device->v0.surface_release_buffer = hybris_gbm_surface_release_buffer_impl;
+   device->v0.surface_has_free_buffers = hybris_gbm_surface_has_free_buffers;
    device->v0.bo_get_offset = hybris_bo_get_offset;
    return device;
 }
