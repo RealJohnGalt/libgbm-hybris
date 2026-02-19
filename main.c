@@ -519,6 +519,9 @@ static struct gbm_device *hybris_device_create(int fd, uint32_t gbm_backend_vers
    device->v0.bo_get_planes = hybris_gbm_bo_get_plane_count;
    device->v0.bo_get_plane_fd = hybris_gbm_bo_get_fd_for_plane;
    device->v0.surface_create = hybris_gbm_surface_create;
+   device->v0.surface_destroy = hybris_gbm_surface_destroy;
+   device->v0.surface_lock_front_buffer = hybris_gbm_surface_lock_front_buffer;
+   device->v0.surface_release_buffer = hybris_gbm_surface_release_buffer;
    device->v0.bo_get_offset = hybris_bo_get_offset;
    return device;
 }
