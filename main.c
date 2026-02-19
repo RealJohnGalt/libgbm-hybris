@@ -2,6 +2,7 @@
 #include <stddef.h>
 #include <xf86drm.h>
 
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -50,9 +51,15 @@ struct gbm_hybris_bo {
    int evdi_lindroid_buff_id;
 };
 
+#define HYBRIS_GBM_MAX_SURFACE_BUFFERS 4
+
 struct gbm_hybris_surface {
    void *reserved_for_egl_gbm;
    struct gbm_surface base;
+   struct gbm_hybris_bo *bos[HYBRIS_GBM_MAX_SURFACE_BUFFERS];
+   int bo_count;
+   int front_index;
+   bool locked[HYBRIS_GBM_MAX_SURFACE_BUFFERS];
 };
 
 struct drm_evdi_gbm_create_buff {
@@ -64,6 +71,12 @@ struct drm_evdi_gbm_create_buff {
 };
 
 static const struct gbm_core *core;
+
+struct gbm_surface *hybris_gbm_surface_create(struct gbm_device *gbm,
+					      uint32_t width, uint32_t height,
+					      uint32_t format, uint32_t flags,
+					      const uint64_t *modifiers,
+					      const unsigned count);
 
 int memfd_create(const char *name, unsigned int flags);
 
@@ -194,14 +207,14 @@ struct gbm_bo *hybris_gbm_bo_create_with_modifiers(struct gbm_device *gbm,
                              const uint64_t *modifiers,
                              const unsigned int count)
 {
-//TBD: it do not work that way :D
-   return NULL;
+   // Advertise only linear modifiers, but treat as a normal bo
+   uint32_t flags = 0;
+   return hybris_gbm_bo_create(gbm, width, height, format, flags, modifiers, count);
 }
 
 struct gbm_bo * hybris_gbm_bo_create_with_modifiers2(struct gbm_device *gbm, uint32_t width, uint32_t height, uint32_t format, const uint64_t *modifiers, const unsigned int count, uint32_t flags){
-//TBD
     printf("[libgbm-hybris] gbm_bo_create_with_modifiers2\n");
-    return NULL;
+    return hybris_gbm_bo_create(gbm, width, height, format, flags, modifiers, count);
 }
 
 struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type, void *buffer, uint32_t usage){
@@ -236,22 +249,99 @@ void* hybris_gbm_bo_map(struct gbm_bo *bo, uint32_t x, uint32_t y, uint32_t widt
 }
 
 void hybris_gbm_surface_destroy(struct gbm_surface *surf) {
-//TBD: Implement surfaces
-    printf("[libgbm-hybris] gbm_surface_destroy called\n");
+    struct gbm_hybris_surface *hsurf = (struct gbm_hybris_surface *)surf;
+    int i;
+
+    if (!hsurf)
+        return;
+
+    /* Destroy any swapchain BOs still owned by this surf */
+    for (i = 0; i < hsurf->bo_count; ++i) {
+        if (hsurf->bos[i]) {
+            hybris_gbm_bo_destroy(&hsurf->bos[i]->base);
+            hsurf->bos[i] = NULL;
+        }
+    }
+
+    if (hsurf->base.v0.modifiers) {
+        free(hsurf->base.v0.modifiers);
+        hsurf->base.v0.modifiers = NULL;
+        hsurf->base.v0.count = 0;
+    }
+
+    free(hsurf);
 }
 
 
 struct gbm_bo* hybris_gbm_surface_lock_front_buffer(struct gbm_surface* surface) {
-//TBD: Implement surfaces
-    printf("[libgbm-hybris] gbm_surface_lock_front_buffer called\n");
-    return (struct gbm_bo*)malloc(sizeof(struct gbm_bo));
+    struct gbm_hybris_surface *hsurf = (struct gbm_hybris_surface *)surface;
+    struct gbm_device *gbm;
+    uint32_t i, idx, start;
+
+    if (!hsurf)
+        return NULL;
+
+    gbm = hsurf->base.gbm;
+    if (!gbm) {
+        fprintf(stderr, "[libgbm-hybris] gbm_surface_lock_front_buffer: missing gbm device\n");
+        return NULL;
+    }
+
+    if (hsurf->bo_count == 0) {
+        for (i = 0; i < HYBRIS_GBM_MAX_SURFACE_BUFFERS; ++i) {
+            struct gbm_bo *bo = hybris_gbm_bo_create(gbm,
+                                                     hsurf->base.v0.width,
+                                                     hsurf->base.v0.height,
+                                                     hsurf->base.v0.format,
+                                                     hsurf->base.v0.flags,
+                                                     hsurf->base.v0.modifiers,
+                                                     hsurf->base.v0.count);
+            if (!bo) {
+                break;
+            }
+            hsurf->bos[i] = gbm_hybris_bo(bo);
+            hsurf->locked[i] = false;
+            hsurf->bo_count++;
+        }
+
+        if (hsurf->bo_count == 0) {
+            fprintf(stderr, "[libgbm-hybris] failed to allocate any BOs for surface swapchain\n");
+            return NULL;
+        }
+
+        hsurf->front_index = -1;
+    }
+
+    start = (hsurf->front_index + 1 + hsurf->bo_count) % hsurf->bo_count;
+    for (i = 0; i < (uint32_t)hsurf->bo_count; ++i) {
+        idx = (start + i) % (uint32_t)hsurf->bo_count;
+        if (!hsurf->locked[idx]) {
+            hsurf->locked[idx] = true;
+            hsurf->front_index = (int)idx;
+            return &hsurf->bos[idx]->base;
+        }
+    }
+
+    errno = EAGAIN;
+    fprintf(stderr, "[libgbm-hybris] no free front buffers in surface swapchain\n");
+    return NULL;
 }
 
 void hybris_gbm_surface_release_buffer(struct gbm_surface* surface, struct gbm_bo* bo) {
-//TBD: Implement surfaces
-    printf("[libgbm-hybris] gbm_surface_release_buffer called\n");
-    if (bo) {
-        free(bo);
+    struct gbm_hybris_surface *hsurf = (struct gbm_hybris_surface *)surface;
+    struct gbm_hybris_bo *hbo;
+    int i;
+
+    if (!hsurf || !bo)
+        return;
+
+    hbo = gbm_hybris_bo(bo);
+
+    for (i = 0; i < hsurf->bo_count; ++i) {
+        if (hsurf->bos[i] == hbo) {
+            hsurf->locked[i] = false;
+            return;
+        }
     }
 }
 
@@ -326,46 +416,58 @@ uint32_t hybris_bo_get_offset(struct gbm_bo *bo, int plane)
 }
 
 struct gbm_surface *hybris_gbm_surface_create_with_modifiers(struct gbm_device *gbm, uint32_t width, uint32_t height, uint32_t format, const uint64_t *modifiers, const unsigned int count){
-//TBD: Implement surfaces
    printf("[libgbm-hybris] gbm_surface_create_with_modifiers\n");
    if ((count && !modifiers) || (modifiers && !count)) {
       errno = EINVAL;
       return NULL;
    }
 
-   return NULL;
+   return hybris_gbm_surface_create(gbm, width, height, format, 0, modifiers, count);
 }
 
 struct gbm_surface *hybris_gbm_surface_create(struct gbm_device *gbm, uint32_t width, uint32_t height, uint32_t format, uint32_t flags, const uint64_t *modifiers, const unsigned count) {
-//TBD: Implement surfaces
-    printf("[libgbm-hybris] gbm_surface_create called with width: %u, height: %u, format: %u, flags: %u\n", width, height, format, flags);
     struct gbm_hybris_surface *surf;
+    uint32_t canon_format = format;
+
+    printf("[libgbm-hybris] gbm_surface_create called with width: %u, height: %u, format: %u, flags: %u\n", width, height, format, flags);
+
     surf = calloc(1, sizeof *surf);
     if (surf == NULL) {
         errno = ENOMEM;
         return NULL;
     }
 
+    if (core && core->v0.format_canonicalize) {
+        canon_format = core->v0.format_canonicalize(format);
+    }
+
     surf->base.gbm = gbm;
     surf->base.v0.width = width;
     surf->base.v0.height = height;
-    surf->base.v0.format = get_hal_pixel_format(format);
+    surf->base.v0.format = canon_format;
     surf->base.v0.flags = flags;
-    surf->base.v0.modifiers = calloc(count, sizeof(*modifiers));
-    if (count && !surf->base.v0.modifiers) {
-        errno = ENOMEM;
-        free(surf);
-        return NULL;
+    surf->base.v0.modifiers = NULL;
+    surf->base.v0.count = 0;
+
+    if (count) {
+        surf->base.v0.modifiers = calloc(count, sizeof(*modifiers));
+        if (!surf->base.v0.modifiers) {
+            errno = ENOMEM;
+            free(surf);
+            return NULL;
+        }
+        if (modifiers) {
+            memcpy(surf->base.v0.modifiers, modifiers, count * sizeof(*modifiers));
+            surf->base.v0.count = count;
+        }
     }
 
-    //uint64_t *v0_modifiers = surf->base.v0.modifiers;
-    //for (int i = 0; i < count; i++) {
-        // compressed buffers don't render correctly when imported
-      //  if (modifiers[i] & ~DRM_FORMAT_MOD_NVIDIA_BLOCK_LINEAR_2D(0x0, 0x1, 0x3, 0xff, 0xf))
-      //      continue;
-      //  *v0_modifiers++ = modifiers[i];
-    //}
-    //surf->base.v0.count = v0_modifiers - surf->base.v0.modifiers;
+    surf->bo_count = 0;
+    surf->front_index = -1;
+    for (int i = 0; i < HYBRIS_GBM_MAX_SURFACE_BUFFERS; ++i) {
+        surf->bos[i] = NULL;
+        surf->locked[i] = false;
+    }
 
     return &surf->base;
 }
