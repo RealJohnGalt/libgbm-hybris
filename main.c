@@ -1,6 +1,7 @@
 #include <fcntl.h> 
 #include <stddef.h>
 #include <xf86drm.h>
+#include <drm/drm_fourcc.h>
 
 #include <stdbool.h>
 #include <stdio.h>
@@ -207,14 +208,13 @@ struct gbm_bo *hybris_gbm_bo_create_with_modifiers(struct gbm_device *gbm,
                              const uint64_t *modifiers,
                              const unsigned int count)
 {
-   // Advertise only linear modifiers, but treat as a normal bo
-   uint32_t flags = 0;
-   return hybris_gbm_bo_create(gbm, width, height, format, flags, modifiers, count);
+   /* Force linear: ignore modifier list and allocate a normal BO */
+   return hybris_gbm_bo_create(gbm, width, height, format, 0, NULL, 0);
 }
 
 struct gbm_bo * hybris_gbm_bo_create_with_modifiers2(struct gbm_device *gbm, uint32_t width, uint32_t height, uint32_t format, const uint64_t *modifiers, const unsigned int count, uint32_t flags){
-    printf("[libgbm-hybris] gbm_bo_create_with_modifiers2\n");
-    return hybris_gbm_bo_create(gbm, width, height, format, flags, modifiers, count);
+    /* Force linear: ignore modifier list and allocate a normal BO */
+    return hybris_gbm_bo_create(gbm, width, height, format, flags, NULL, 0);
 }
 
 struct gbm_bo *hybris_gbm_bo_import(struct gbm_device *gbm, uint32_t type, void *buffer, uint32_t usage){
@@ -237,9 +237,7 @@ uint32_t hybris_gbm_bo_get_stride_for_plane(struct gbm_bo *bo, int plane)
 }
 
 uint64_t hybris_gbm_bo_get_modifier(struct gbm_bo* bo) {
-//TBD: Implement modifier
-//    printf("[libgbm-hybris] gbm_bo_get_modifier called\n");
-    return 0;
+    return DRM_FORMAT_MOD_LINEAR;
 }
 
 void* hybris_gbm_bo_map(struct gbm_bo *bo, uint32_t x, uint32_t y, uint32_t width, uint32_t height, uint32_t flags, uint32_t *stride, void **map_data) {
@@ -450,16 +448,15 @@ struct gbm_surface *hybris_gbm_surface_create(struct gbm_device *gbm, uint32_t w
     surf->base.v0.count = 0;
 
     if (count) {
-        surf->base.v0.modifiers = calloc(count, sizeof(*modifiers));
+	// Force linear
+        surf->base.v0.modifiers = calloc(1, sizeof(uint64_t));
         if (!surf->base.v0.modifiers) {
             errno = ENOMEM;
             free(surf);
             return NULL;
         }
-        if (modifiers) {
-            memcpy(surf->base.v0.modifiers, modifiers, count * sizeof(*modifiers));
-            surf->base.v0.count = count;
-        }
+        surf->base.v0.modifiers[0] = DRM_FORMAT_MOD_LINEAR;
+        surf->base.v0.count = 1;
     }
 
     surf->bo_count = 0;
