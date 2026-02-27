@@ -139,12 +139,13 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
 
     int usage = 0;
 
+    // Force linear
+    usage |= GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN;
+
     if (flags & GBM_BO_USE_SCANOUT)
         usage |= GRALLOC_USAGE_HW_FB;
     if (flags & GBM_BO_USE_RENDERING)
         usage |= GRALLOC_USAGE_HW_RENDER;
-    if (flags & GBM_BO_USE_LINEAR)
-        usage |= GRALLOC_USAGE_SW_READ_RARELY | GRALLOC_USAGE_SW_WRITE_RARELY;
 
     int stride = 0;
     buffer_handle_t handle = NULL;
