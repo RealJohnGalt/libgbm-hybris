@@ -29,7 +29,7 @@
 #define DRM_IOCTL_EVDI_GBM_DEL_BUFF DRM_IOWR(DRM_COMMAND_BASE +  \
 	DRM_EVDI_GBM_DEL_BUFF, struct drm_evdi_gbm_del_buff)
 
-#define DRM_IOCTL_EVDI_GBM_ADD_BUFF DRM_IOWR(0x40 +  \
+#define DRM_IOCTL_EVDI_GBM_ADD_BUFF DRM_IOWR(DRM_COMMAND_BASE +  \
 	DRM_EVDI_GBM_ADD_BUFF, struct drm_evdi_gbm_add_buf)
 
 #define DRM_IOCTL_EVDI_GBM_CREATE_BUFF DRM_IOWR(DRM_COMMAND_BASE +  \
@@ -48,6 +48,7 @@ struct gbm_hybris_bo {
    struct gbm_bo base;
 //   buffer_handle_t handle;
    int evdi_lindroid_buff_id;
+   int fd;
 };
 
 struct gbm_hybris_surface {
@@ -132,6 +133,7 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
     format = core->v0.format_canonicalize(format);
 
     bo->base.gbm = device;
+    bo->fd = -1;
 
     bo->base.v0.width = width;
     bo->base.v0.height = height;
@@ -147,11 +149,11 @@ struct gbm_bo* hybris_gbm_bo_create(struct gbm_device* device, uint32_t width, u
         usage |= GRALLOC_USAGE_SW_READ_RARELY | GRALLOC_USAGE_SW_WRITE_RARELY;
 
     int stride = 0;
-    buffer_handle_t handle = NULL;
     struct drm_evdi_gbm_create_buff cmd;
+    memset(&cmd, 0, sizeof(cmd));
     cmd.width = width;
     cmd.height = height;
-    cmd.format = HAL_PIXEL_FORMAT_RGBA_8888;
+    cmd.format = get_hal_pixel_format(format);
     cmd.stride = &stride;
     cmd.id = &bo->evdi_lindroid_buff_id;
     int ret = ioctl(device->v0.fd, DRM_IOCTL_EVDI_GBM_CREATE_BUFF, &cmd);
@@ -175,6 +177,9 @@ static void hybris_gbm_bo_destroy(struct gbm_bo *_bo)
 
     if (ioctl(bo->base.gbm->v0.fd, DRM_IOCTL_EVDI_GBM_DEL_BUFF, &close_args) < 0) {
         perror("[libgbm-hybris] DRM_IOCTL_EVDI_GBM_DEL_BUFF failed");
+    }
+    if (bo->fd >= 0) {
+        close(bo->fd);
     }
     free(bo);
 }
@@ -236,8 +241,13 @@ void* hybris_gbm_bo_map(struct gbm_bo *bo, uint32_t x, uint32_t y, uint32_t widt
 }
 
 void hybris_gbm_surface_destroy(struct gbm_surface *surf) {
-//TBD: Implement surfaces
+    struct gbm_hybris_surface *hybris_surf = (struct gbm_hybris_surface *)surf;
     printf("[libgbm-hybris] gbm_surface_destroy called\n");
+    if (hybris_surf) {
+        if (hybris_surf->base.v0.modifiers)
+            free(hybris_surf->base.v0.modifiers);
+        free(hybris_surf);
+    }
 }
 
 
@@ -272,7 +282,11 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
         return -1;
     }
 
-    int fd = memfd_create("whatever", MFD_CLOEXEC);
+    if (bo->fd >= 0) {
+        return dup(bo->fd);
+    }
+
+    int fd = memfd_create("lindroid_gbm_fd", MFD_CLOEXEC);
 
     if (fd == -1) {
         printf("[libgbm-hybris] memfd_create failed\n");
@@ -280,18 +294,22 @@ int hybris_gbm_bo_get_fd(struct gbm_bo* _bo) {
     }
 
     if(write(fd, &bo->evdi_lindroid_buff_id, sizeof(int)) != sizeof(int)) {
-        printf("[libgbm-hybris] failed to write evdi_lindroid_buff_id into mefd\n");
+        printf("[libgbm-hybris] failed to write evdi_lindroid_buff_id into memfd\n");
         close(fd);
         return -1;
     }
 
-    const size_t size = (size_t)bo->base.v0.stride * bo->base.v0.height;
+    size_t size = (size_t)bo->base.v0.stride * bo->base.v0.height;
+    if (size < sizeof(int))
+        size = sizeof(int);
+
     if (ftruncate(fd, size) < 0) {
         close(fd);
         return -1;
     }
 
-    return fd;
+    bo->fd = fd;
+    return dup(bo->fd);
 }
 
 static union gbm_bo_handle hybris_gbm_bo_get_handle_for_plane(struct gbm_bo *_bo, int plane)
@@ -349,7 +367,7 @@ struct gbm_surface *hybris_gbm_surface_create(struct gbm_device *gbm, uint32_t w
     surf->base.gbm = gbm;
     surf->base.v0.width = width;
     surf->base.v0.height = height;
-    surf->base.v0.format = get_hal_pixel_format(format);
+    surf->base.v0.format = format;
     surf->base.v0.flags = flags;
     surf->base.v0.modifiers = calloc(count, sizeof(*modifiers));
     if (count && !surf->base.v0.modifiers) {
