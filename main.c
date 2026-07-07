@@ -160,7 +160,7 @@ static int get_hal_pixel_format(uint32_t gbm_format)
 
     switch (gbm_format) {
     case GBM_FORMAT_ABGR8888:
-        format = HAL_PIXEL_FORMAT_RGBA_8888;
+        format = HAL_PIXEL_FORMAT_BGRA_8888;
         break;
     case GBM_FORMAT_XBGR8888:
         format = HAL_PIXEL_FORMAT_RGBX_8888;
